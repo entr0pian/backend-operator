@@ -1,0 +1,639 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	appsv1alpha1 "github.com/entr0pian/taskapp-operator/api/v1alpha1"
+)
+
+const backendFinalizer = "apps.taskapp.io/finalizer"
+
+var sqsQueueGVK = schema.GroupVersionKind{
+	Group:   "sqs.aws.upbound.io",
+	Version: "v1beta1",
+	Kind:    "Queue",
+}
+
+// BackendReconciler reconciles a Backend object
+type BackendReconciler struct {
+	client.Client
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+}
+
+// +kubebuilder:rbac:groups=apps.taskapp.io,resources=backends,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps.taskapp.io,resources=backends/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps.taskapp.io,resources=backends/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=sqs.aws.upbound.io,resources=queues,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=sqs.aws.upbound.io,resources=queues/status,verbs=get
+
+func (r *BackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	backend := &appsv1alpha1.Backend{}
+	if err := r.Get(ctx, req.NamespacedName, backend); err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	if !backend.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, r.handleDeletion(ctx, backend)
+	}
+
+	if !controllerutil.ContainsFinalizer(backend, backendFinalizer) {
+		log.Info("adding finalizer")
+		controllerutil.AddFinalizer(backend, backendFinalizer)
+		if err := r.Update(ctx, backend); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	queueURL, requeue, err := r.reconcileSQS(ctx, backend)
+	if err != nil {
+		log.Error(err, "failed to reconcile SQS Queue")
+		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	if requeue {
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	if err := r.reconcileDeployment(ctx, backend, queueURL); err != nil {
+		log.Error(err, "failed to reconcile Deployment")
+		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileService(ctx, backend); err != nil {
+		log.Error(err, "failed to reconcile Service")
+		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	if err := r.updateStatus(ctx, backend, queueURL); err != nil {
+		log.Error(err, "failed to update status")
+		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *BackendReconciler) reconcileSQS(ctx context.Context, backend *appsv1alpha1.Backend) (string, bool, error) {
+	log := logf.FromContext(ctx)
+
+	if backend.Spec.Queue == nil {
+		log.Info("queue spec removed, deleting owned queues")
+		return "", false, r.deleteQueue(ctx, backend)
+	}
+
+	// If deadLetter is requested, ensure the DLQ exists and is ready first.
+	dlqARN := ""
+	if backend.Spec.Queue.DeadLetter {
+		arn, requeue, err := r.reconcileQueue(ctx, backend, sqsDLQName(backend), "", false)
+		if err != nil {
+			return "", false, err
+		}
+		if requeue || arn == "" {
+			log.Info("waiting for DLQ to become ready", "queue", sqsDLQName(backend))
+			return "", true, nil
+		}
+		log.Info("DLQ ready", "queue", sqsDLQName(backend))
+		dlqARN = arn
+	}
+
+	url, requeue, err := r.reconcileQueue(ctx, backend, sqsQueueName(backend), dlqARN, backend.Spec.Queue.Type == appsv1alpha1.QueueTypeFifo)
+	if err != nil {
+		return "", false, err
+	}
+	if requeue || url == "" {
+		log.Info("waiting for Queue to become ready", "queue", sqsQueueName(backend))
+		return "", true, nil
+	}
+	return url, false, nil
+}
+
+// reconcileQueue ensures a single Crossplane Queue CR exists with the given name and returns
+// its URL (for standard queues) or ARN (for DLQs, read from status.atProvider.arn).
+// resultValue is the URL for the main queue, the ARN for the DLQ.
+func (r *BackendReconciler) reconcileQueue(ctx context.Context, backend *appsv1alpha1.Backend, name, dlqARN string, fifo bool) (string, bool, error) {
+	log := logf.FromContext(ctx)
+
+	desired := &unstructured.Unstructured{}
+	desired.SetGroupVersionKind(sqsQueueGVK)
+	desired.SetName(name)
+	desired.SetLabels(map[string]string{
+		"apps.taskapp.io/owned-by-backend":   backend.Name,
+		"apps.taskapp.io/owned-by-namespace": backend.Namespace,
+	})
+
+	forProvider := map[string]any{
+		"name":   name,
+		"region": sqsRegion(),
+		"tags": map[string]any{
+			"managed-by": "taskapp-operator",
+		},
+	}
+	if fifo {
+		forProvider["fifoQueue"] = true
+	}
+	if dlqARN != "" {
+		forProvider["redrivePolicy"] = []any{
+			map[string]any{
+				"deadLetterTargetArn": dlqARN,
+				"maxReceiveCount":     5,
+			},
+		}
+	}
+
+	if err := unstructured.SetNestedField(desired.Object, forProvider, "spec", "forProvider"); err != nil {
+		return "", false, err
+	}
+	if err := unstructured.SetNestedField(desired.Object, "default", "spec", "providerConfigRef", "name"); err != nil {
+		return "", false, err
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(sqsQueueGVK)
+	err := r.Get(ctx, types.NamespacedName{Name: name}, existing)
+	if errors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return "", false, err
+		}
+		log.Info("created queue", "queue", name)
+		r.Recorder.Event(backend, corev1.EventTypeNormal, "QueueCreated", fmt.Sprintf("Created Queue %s", name))
+		return "", true, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+
+	// Check Ready condition
+	conditions, _, _ := unstructured.NestedSlice(existing.Object, "status", "conditions")
+	ready := false
+	for _, c := range conditions {
+		cond, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if cond["type"] == "Ready" && cond["status"] == "True" {
+			ready = true
+			break
+		}
+	}
+	if !ready {
+		log.Info("queue not yet ready, requeueing", "queue", name)
+		return "", true, nil
+	}
+
+	// For DLQs we return the ARN; for main queues we return the URL.
+	if dlqARN == "" && !fifo {
+		// this is a DLQ call — return ARN
+		arn, _, _ := unstructured.NestedString(existing.Object, "status", "atProvider", "arn")
+		log.Info("queue ready", "queue", name)
+		return arn, false, nil
+	}
+	url, _, _ := unstructured.NestedString(existing.Object, "status", "atProvider", "url")
+	log.Info("queue ready", "queue", name)
+	return url, false, nil
+}
+
+func (r *BackendReconciler) deleteQueue(ctx context.Context, backend *appsv1alpha1.Backend) error {
+	log := logf.FromContext(ctx)
+
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   sqsQueueGVK.Group,
+		Version: sqsQueueGVK.Version,
+		Kind:    "QueueList",
+	})
+	if err := r.List(ctx, list, client.MatchingLabels{
+		"apps.taskapp.io/owned-by-backend":   backend.Name,
+		"apps.taskapp.io/owned-by-namespace": backend.Namespace,
+	}); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		if err := client.IgnoreNotFound(r.Delete(ctx, &list.Items[i])); err != nil {
+			return err
+		}
+		log.Info("deleted owned queue", "queue", list.Items[i].GetName())
+	}
+	return nil
+}
+
+func (r *BackendReconciler) handleDeletion(ctx context.Context, backend *appsv1alpha1.Backend) error {
+	log := logf.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(backend, backendFinalizer) {
+		return nil
+	}
+
+	log.Info("handling deletion")
+
+	if err := r.deleteDeployment(ctx, backend); err != nil {
+		return err
+	}
+	if err := r.deleteService(ctx, backend); err != nil {
+		return err
+	}
+	if err := r.deleteQueue(ctx, backend); err != nil {
+		return err
+	}
+
+	log.Info("finalizer removed, deletion complete")
+	controllerutil.RemoveFinalizer(backend, backendFinalizer)
+	return r.Update(ctx, backend)
+}
+
+func (r *BackendReconciler) deleteDeployment(ctx context.Context, backend *appsv1alpha1.Backend) error {
+	deploy := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: deploymentName(backend), Namespace: backend.Namespace}, deploy)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, deploy))
+}
+
+func (r *BackendReconciler) deleteService(ctx context.Context, backend *appsv1alpha1.Backend) error {
+	svc := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: serviceName(backend), Namespace: backend.Namespace}, svc)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, svc))
+}
+
+func (r *BackendReconciler) reconcileDeployment(ctx context.Context, backend *appsv1alpha1.Backend, queueURL string) error {
+	log := logf.FromContext(ctx)
+
+	desired := r.buildDeployment(backend, queueURL)
+	if err := ctrl.SetControllerReference(backend, desired, r.Scheme); err != nil {
+		return err
+	}
+
+	existing := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	if errors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return err
+		}
+		log.Info("created deployment", "deployment", desired.Name)
+		r.Recorder.Event(backend, corev1.EventTypeNormal, "DeploymentCreated", "Created deployment")
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	desiredContainer := desired.Spec.Template.Spec.Containers[0]
+	existingContainer := existing.Spec.Template.Spec.Containers[0]
+	if equality.Semantic.DeepEqual(existing.Spec.Replicas, desired.Spec.Replicas) &&
+		existingContainer.Image == desiredContainer.Image &&
+		equality.Semantic.DeepEqual(existingContainer.Env, desiredContainer.Env) {
+		return nil
+	}
+	patch := client.MergeFrom(existing.DeepCopy())
+	existing.Spec.Replicas = desired.Spec.Replicas
+	existing.Spec.Template.Spec.Containers[0].Image = desiredContainer.Image
+	existing.Spec.Template.Spec.Containers[0].Env = desiredContainer.Env
+	if err := r.Patch(ctx, existing, patch); err != nil {
+		return err
+	}
+	log.Info("updated deployment", "deployment", existing.Name)
+	r.Recorder.Event(backend, corev1.EventTypeNormal, "DeploymentUpdated", "Updated deployment")
+	return nil
+}
+
+func (r *BackendReconciler) reconcileService(ctx context.Context, backend *appsv1alpha1.Backend) error {
+	log := logf.FromContext(ctx)
+
+	desired := r.buildService(backend)
+	if err := ctrl.SetControllerReference(backend, desired, r.Scheme); err != nil {
+		return err
+	}
+
+	existing := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	if errors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return err
+		}
+		log.Info("created service", "service", desired.Name)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if equality.Semantic.DeepEqual(existing.Spec.Ports, desired.Spec.Ports) &&
+		equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
+		return nil
+	}
+	existing.Spec.Ports = desired.Spec.Ports
+	existing.Spec.Selector = desired.Spec.Selector
+	if err := r.Update(ctx, existing); err != nil {
+		return err
+	}
+	log.Info("updated service", "service", existing.Name)
+	return nil
+}
+
+func (r *BackendReconciler) updateStatus(ctx context.Context, backend *appsv1alpha1.Backend, queueURL string) error {
+	deploy := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Name: deploymentName(backend), Namespace: backend.Namespace}, deploy); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+
+	patch := client.MergeFrom(backend.DeepCopy())
+
+	backend.Status.ReadyReplicas = deploy.Status.ReadyReplicas
+	backend.Status.QueueURL = queueURL
+
+	desired := int32(1)
+	if backend.Spec.Replicas != nil {
+		desired = *backend.Spec.Replicas
+	}
+
+	available := metav1.ConditionFalse
+	reason := "DeploymentUnavailable"
+	message := fmt.Sprintf("%d/%d replicas ready", deploy.Status.ReadyReplicas, desired)
+	if deploy.Status.ReadyReplicas >= desired {
+		available = metav1.ConditionTrue
+		reason = "DeploymentAvailable"
+	}
+
+	r.setCondition(backend, metav1.Condition{
+		Type:               "Available",
+		Status:             available,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: backend.Generation,
+		LastTransitionTime: metav1.Now(),
+	})
+
+	// SQSReady condition — only set when a queue is requested
+	if backend.Spec.Queue != nil {
+		sqsStatus := metav1.ConditionFalse
+		sqsReason := "QueueProvisioning"
+		sqsMessage := "waiting for SQS queue to become ready"
+		if queueURL != "" {
+			sqsStatus = metav1.ConditionTrue
+			sqsReason = "QueueReady"
+			sqsMessage = fmt.Sprintf("queue URL: %s", queueURL)
+		}
+		r.setCondition(backend, metav1.Condition{
+			Type:               "SQSReady",
+			Status:             sqsStatus,
+			Reason:             sqsReason,
+			Message:            sqsMessage,
+			ObservedGeneration: backend.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+	} else {
+		backend.Status.Conditions = removeCondition(backend.Status.Conditions, "SQSReady")
+	}
+
+	return client.IgnoreNotFound(r.Status().Patch(ctx, backend, patch))
+}
+
+func (r *BackendReconciler) setCondition(backend *appsv1alpha1.Backend, cond metav1.Condition) {
+	existing := findCondition(backend.Status.Conditions, cond.Type)
+	if existing != nil {
+		if existing.Status != cond.Status {
+			existing.LastTransitionTime = metav1.Now()
+			if cond.Type == "Available" {
+				if cond.Status == metav1.ConditionFalse {
+					r.Recorder.Event(backend, corev1.EventTypeWarning, cond.Reason, cond.Message)
+				} else {
+					r.Recorder.Event(backend, corev1.EventTypeNormal, cond.Reason, cond.Message)
+				}
+			}
+		}
+		existing.Status = cond.Status
+		existing.Reason = cond.Reason
+		existing.Message = cond.Message
+		existing.ObservedGeneration = cond.ObservedGeneration
+	} else {
+		backend.Status.Conditions = append(backend.Status.Conditions, cond)
+	}
+}
+
+func (r *BackendReconciler) buildDeployment(backend *appsv1alpha1.Backend, queueURL string) *appsv1.Deployment {
+	labels := map[string]string{
+		"app.kubernetes.io/name":       "backend",
+		"app.kubernetes.io/instance":   backend.Name,
+		"app.kubernetes.io/managed-by": "taskapp-operator",
+	}
+
+	replicas := int32(1)
+	if backend.Spec.Replicas != nil {
+		replicas = *backend.Spec.Replicas
+	}
+
+	probeHandler := corev1.ProbeHandler{
+		HTTPGet: &corev1.HTTPGetAction{
+			Path: "/ready",
+			Port: intstr.FromInt32(8080),
+		},
+	}
+
+	envVars := []corev1.EnvVar{
+		{Name: "PORT", Value: "8080"},
+		{Name: "DB_HOST", Value: "taskapp-database"},
+		{Name: "DB_PORT", Value: "5432"},
+		{Name: "DB_USER", Value: "taskuser"},
+		{Name: "DB_NAME", Value: "taskdb"},
+		{
+			Name: "DB_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: backend.Spec.DBSecret},
+					Key:                  "POSTGRES_PASSWORD",
+				},
+			},
+		},
+	}
+	if queueURL != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: backend.Spec.Queue.URLEnvVar, Value: queueURL})
+	}
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deploymentName(backend),
+			Namespace: backend.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "backend",
+							Image: fmt.Sprintf("%s:%s", backend.Spec.Image, backend.Spec.Tag),
+							Ports: []corev1.ContainerPort{{ContainerPort: 8080}},
+							Env:   envVars,
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler:        probeHandler,
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+								FailureThreshold:    3,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (r *BackendReconciler) buildService(backend *appsv1alpha1.Backend) *corev1.Service {
+	labels := map[string]string{
+		"app.kubernetes.io/name":       "backend",
+		"app.kubernetes.io/instance":   backend.Name,
+		"app.kubernetes.io/managed-by": "taskapp-operator",
+	}
+
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName(backend),
+			Namespace: backend.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{
+				{
+					Port:       80,
+					TargetPort: intstr.FromInt32(8080),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+			Type: corev1.ServiceTypeClusterIP,
+		},
+	}
+}
+
+func deploymentName(b *appsv1alpha1.Backend) string { return b.Name + "-backend" }
+func serviceName(b *appsv1alpha1.Backend) string    { return b.Name + "-backend" }
+
+func sqsQueueName(b *appsv1alpha1.Backend) string {
+	name := b.Namespace + "-" + b.Name + "-queue"
+	if b.Spec.Queue != nil && b.Spec.Queue.Type == appsv1alpha1.QueueTypeFifo {
+		name += ".fifo"
+	}
+	return name
+}
+
+func sqsDLQName(b *appsv1alpha1.Backend) string {
+	name := b.Namespace + "-" + b.Name + "-queue-dlq"
+	if b.Spec.Queue != nil && b.Spec.Queue.Type == appsv1alpha1.QueueTypeFifo {
+		name += ".fifo"
+	}
+	return name
+}
+
+func sqsRegion() string {
+	if r := os.Getenv("DEFAULT_QUEUE_REGION"); r != "" {
+		return r
+	}
+	return "eu-west-1"
+}
+
+func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
+
+func removeCondition(conditions []metav1.Condition, condType string) []metav1.Condition {
+	result := make([]metav1.Condition, 0, len(conditions))
+	for _, c := range conditions {
+		if c.Type != condType {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	queueType := &unstructured.Unstructured{}
+	queueType.SetGroupVersionKind(sqsQueueGVK)
+
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&appsv1alpha1.Backend{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Watches(
+			queueType,
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				labels := obj.GetLabels()
+				ns, nsOk := labels["apps.taskapp.io/owned-by-namespace"]
+				name, nameOk := labels["apps.taskapp.io/owned-by-backend"]
+				if !nsOk || !nameOk {
+					return nil
+				}
+				return []reconcile.Request{
+					{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}},
+				}
+			}),
+		).
+		Named("backend").
+		Complete(r)
+}

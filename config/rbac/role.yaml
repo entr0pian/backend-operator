@@ -1,0 +1,74 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps.taskapp.io
+  resources:
+  - backends
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps.taskapp.io
+  resources:
+  - backends/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - apps.taskapp.io
+  resources:
+  - backends/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - sqs.aws.upbound.io
+  resources:
+  - queues
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sqs.aws.upbound.io
+  resources:
+  - queues/status
+  verbs:
+  - get
