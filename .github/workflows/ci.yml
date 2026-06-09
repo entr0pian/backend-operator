@@ -61,13 +61,13 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/taskapp-backend-operator:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/taskapp-backend-operator:${{ github.sha }}
 
-#      - name: Update Helm chart image tag
-#        run: |
-#          git clone https://x-access-token:${{ secrets.HELMCHARTS_TOKEN }}@github.com/entr0pian/helmcharts.git
-#          cd taskapp-helmcharts
-#          sed -i "s/tag: .*/tag: \"${{ github.sha }}\"/" backend-operator/values.yaml
-#          git config user.email "github-actions@github.com"
-#          git config user.name "GitHub Actions"
-#          git add backend-operator/values.yaml
-#          git commit -m "ci: update backend-operator image tag to ${{ github.sha }}"
-#          git push
+      - name: Update Helm chart image tag
+        run: |
+          git clone https://x-access-token:${{ secrets.HELMCHARTS_TOKEN }}@github.com/entr0pian/helm-charts.git
+          cd helm-charts
+          sed -i "s/tag: .*/tag: \"${{ github.sha }}\"/" backend-operator/values.yaml
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git add backend-operator/values.yaml
+          git commit -m "ci: update backend-operator image tag to ${{ github.sha }}"
+          git push
