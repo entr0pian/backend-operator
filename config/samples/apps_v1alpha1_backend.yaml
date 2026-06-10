@@ -10,7 +10,7 @@ spec:
   tag: latest
   replicas: 1
   dbSecret: taskapp-database-secret
-#  queue:
-#    type: standard
-#    deadLetter: false
+  queue:
+    type: standard
+    deadLetter: false
     # urlEnvVar: SQS_QUEUE_URL   # optional — override the env var name injected into the container

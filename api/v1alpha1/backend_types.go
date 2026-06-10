@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -70,6 +71,11 @@ type BackendSpec struct {
 	// Omit the field entirely if no queue is needed.
 	// +optional
 	Queue *QueueSpec `json:"queue,omitempty"`
+
+	// extraEnv is a list of additional environment variables appended to the
+	// backend container after the built-in vars.
+	// +optional
+	ExtraEnv []corev1.EnvVar `json:"extraEnv,omitempty"`
 }
 
 // BackendStatus defines the observed state of Backend.

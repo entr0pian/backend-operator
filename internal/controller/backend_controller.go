@@ -506,6 +506,7 @@ func (r *BackendReconciler) buildDeployment(backend *appsv1alpha1.Backend, queue
 	if queueURL != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: backend.Spec.Queue.URLEnvVar, Value: queueURL})
 	}
+	envVars = append(envVars, backend.Spec.ExtraEnv...)
 
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
