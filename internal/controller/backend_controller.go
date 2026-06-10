@@ -133,7 +133,7 @@ func (r *BackendReconciler) reconcileSQS(ctx context.Context, backend *appsv1alp
 	// If deadLetter is requested, ensure the DLQ exists and is ready first.
 	dlqARN := ""
 	if backend.Spec.Queue.DeadLetter {
-		arn, requeue, err := r.reconcileQueue(ctx, backend, sqsDLQName(backend), "", false)
+		arn, requeue, err := r.reconcileQueue(ctx, backend, sqsDLQName(backend), "", false, true) // returnARN=true: ARN needed for main queue redrivePolicy
 		if err != nil {
 			return "", false, err
 		}
@@ -145,7 +145,7 @@ func (r *BackendReconciler) reconcileSQS(ctx context.Context, backend *appsv1alp
 		dlqARN = arn
 	}
 
-	url, requeue, err := r.reconcileQueue(ctx, backend, sqsQueueName(backend), dlqARN, backend.Spec.Queue.Type == appsv1alpha1.QueueTypeFifo)
+	url, requeue, err := r.reconcileQueue(ctx, backend, sqsQueueName(backend), dlqARN, backend.Spec.Queue.Type == appsv1alpha1.QueueTypeFifo, false) // returnARN=false: URL needed for SQS_QUEUE_URL env var
 	if err != nil {
 		return "", false, err
 	}
@@ -156,10 +156,10 @@ func (r *BackendReconciler) reconcileSQS(ctx context.Context, backend *appsv1alp
 	return url, false, nil
 }
 
-// reconcileQueue ensures a single Crossplane Queue CR exists with the given name and returns
-// its URL (for standard queues) or ARN (for DLQs, read from status.atProvider.arn).
-// resultValue is the URL for the main queue, the ARN for the DLQ.
-func (r *BackendReconciler) reconcileQueue(ctx context.Context, backend *appsv1alpha1.Backend, name, dlqARN string, fifo bool) (string, bool, error) {
+// reconcileQueue ensures a single Crossplane Queue CR exists with the given name.
+// Set returnARN=true when the caller needs the queue's ARN (DLQ calls, for use in
+// redrivePolicy); set returnARN=false to get the queue URL (main queue, for SQS_QUEUE_URL).
+func (r *BackendReconciler) reconcileQueue(ctx context.Context, backend *appsv1alpha1.Backend, name, dlqARN string, fifo, returnARN bool) (string, bool, error) {
 	log := logf.FromContext(ctx)
 
 	desired := &unstructured.Unstructured{}
@@ -229,15 +229,12 @@ func (r *BackendReconciler) reconcileQueue(ctx context.Context, backend *appsv1a
 		return "", true, nil
 	}
 
-	// For DLQs we return the ARN; for main queues we return the URL.
-	if dlqARN == "" && !fifo {
-		// this is a DLQ call — return ARN
+	log.Info("queue ready", "queue", name)
+	if returnARN {
 		arn, _, _ := unstructured.NestedString(existing.Object, "status", "atProvider", "arn")
-		log.Info("queue ready", "queue", name)
 		return arn, false, nil
 	}
 	url, _, _ := unstructured.NestedString(existing.Object, "status", "atProvider", "url")
-	log.Info("queue ready", "queue", name)
 	return url, false, nil
 }
 
