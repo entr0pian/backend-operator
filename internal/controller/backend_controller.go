@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -284,7 +285,7 @@ func (r *BackendReconciler) reconcileExternalSecret(ctx context.Context, backend
 
 	if backend.Spec.Queue == nil {
 		err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: backend.Namespace}, existing)
-		if errors.IsNotFound(err) {
+		if errors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
 			return nil
 		}
 		if err != nil {
