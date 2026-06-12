@@ -14,3 +14,6 @@ spec:
     type: standard
     deadLetter: false
     # urlEnvVar: SQS_QUEUE_URL   # optional — override the env var name injected into the container
+  extraEnv:
+    - name: AWS_REGION
+      value: eu-west-1

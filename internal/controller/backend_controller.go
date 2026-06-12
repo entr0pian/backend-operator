@@ -51,6 +51,12 @@ var sqsQueueGVK = schema.GroupVersionKind{
 	Kind:    "Queue",
 }
 
+var externalSecretGVK = schema.GroupVersionKind{
+	Group:   "external-secrets.io",
+	Version: "v1beta1",
+	Kind:    "ExternalSecret",
+}
+
 // BackendReconciler reconciles a Backend object
 type BackendReconciler struct {
 	client.Client
@@ -65,6 +71,7 @@ type BackendReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=sqs.aws.upbound.io,resources=queues,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=sqs.aws.upbound.io,resources=queues/status,verbs=get
+// +kubebuilder:rbac:groups=external-secrets.io,resources=externalsecrets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *BackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -88,6 +95,12 @@ func (r *BackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
+	}
+
+	if err := r.reconcileExternalSecret(ctx, backend); err != nil {
+		log.Error(err, "failed to reconcile ExternalSecret")
+		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+		return ctrl.Result{}, err
 	}
 
 	queueURL, requeue, err := r.reconcileSQS(ctx, backend)
@@ -259,6 +272,91 @@ func (r *BackendReconciler) deleteQueue(ctx context.Context, backend *appsv1alph
 		}
 		log.Info("deleted owned queue", "queue", list.Items[i].GetName())
 	}
+	return nil
+}
+
+func (r *BackendReconciler) reconcileExternalSecret(ctx context.Context, backend *appsv1alpha1.Backend) error {
+	log := logf.FromContext(ctx)
+	name := backend.Name + "-aws-credentials"
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(externalSecretGVK)
+
+	if backend.Spec.Queue == nil {
+		err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: backend.Namespace}, existing)
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := r.Delete(ctx, existing); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		log.Info("deleted ExternalSecret", "name", name)
+		return nil
+	}
+
+	desired := &unstructured.Unstructured{}
+	desired.SetGroupVersionKind(externalSecretGVK)
+	desired.SetName(name)
+	desired.SetNamespace(backend.Namespace)
+	if err := ctrl.SetControllerReference(backend, desired, r.Scheme); err != nil {
+		return err
+	}
+
+	spec := map[string]any{
+		"refreshInterval": "1h",
+		"secretStoreRef": map[string]any{
+			"name": clusterSecretStoreName(),
+			"kind": "ClusterSecretStore",
+		},
+		"target": map[string]any{
+			"name":           name,
+			"creationPolicy": "Owner",
+		},
+		"data": []any{
+			map[string]any{
+				"secretKey": "AWS_ACCESS_KEY_ID",
+				"remoteRef": map[string]any{
+					"key":      credentialsSecretPath(),
+					"property": "aws_access_key_id",
+				},
+			},
+			map[string]any{
+				"secretKey": "AWS_SECRET_ACCESS_KEY",
+				"remoteRef": map[string]any{
+					"key":      credentialsSecretPath(),
+					"property": "aws_secret_access_key",
+				},
+			},
+		},
+	}
+	if err := unstructured.SetNestedField(desired.Object, spec, "spec"); err != nil {
+		return err
+	}
+
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: backend.Namespace}, existing)
+	if errors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return err
+		}
+		log.Info("created ExternalSecret", "name", name)
+		r.Recorder.Event(backend, corev1.EventTypeNormal, "ExternalSecretCreated", fmt.Sprintf("Created ExternalSecret %s", name))
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	patch := client.MergeFrom(existing.DeepCopy())
+	if err := unstructured.SetNestedField(existing.Object, spec, "spec"); err != nil {
+		return err
+	}
+	if err := r.Patch(ctx, existing, patch); err != nil {
+		return err
+	}
+	log.Info("patched ExternalSecret", "name", name)
 	return nil
 }
 
@@ -503,6 +601,29 @@ func (r *BackendReconciler) buildDeployment(backend *appsv1alpha1.Backend, queue
 	if queueURL != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: backend.Spec.Queue.URLEnvVar, Value: queueURL})
 	}
+	if backend.Spec.Queue != nil {
+		credSecretName := backend.Name + "-aws-credentials"
+		envVars = append(envVars,
+			corev1.EnvVar{
+				Name: "AWS_ACCESS_KEY_ID",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: credSecretName},
+						Key:                  "AWS_ACCESS_KEY_ID",
+					},
+				},
+			},
+			corev1.EnvVar{
+				Name: "AWS_SECRET_ACCESS_KEY",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: credSecretName},
+						Key:                  "AWS_SECRET_ACCESS_KEY",
+					},
+				},
+			},
+		)
+	}
 	envVars = append(envVars, backend.Spec.ExtraEnv...)
 
 	return &appsv1.Deployment{
@@ -588,6 +709,20 @@ func sqsRegion() string {
 		return r
 	}
 	return "eu-west-1"
+}
+
+func clusterSecretStoreName() string {
+	if v := os.Getenv("CLUSTER_SECRET_STORE"); v != "" {
+		return v
+	}
+	return "aws-secrets-manager"
+}
+
+func credentialsSecretPath() string {
+	if v := os.Getenv("CREDENTIALS_SECRET_PATH"); v != "" {
+		return v
+	}
+	return "taskapp/prod/backend-credentials"
 }
 
 func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
