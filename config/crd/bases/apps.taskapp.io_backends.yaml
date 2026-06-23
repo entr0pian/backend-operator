@@ -27,6 +27,10 @@ spec:
     - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
+    - jsonPath: .status.conditions[?(@.type=="RDSReady")].status
+      name: RDSReady
+      priority: 1
+      type: string
     - jsonPath: .status.queueURL
       name: QueueURL
       priority: 1
@@ -59,9 +63,39 @@ spec:
           spec:
             description: spec defines the desired state of Backend
             properties:
+              database:
+                description: |-
+                  database optionally provisions an RDS PostgreSQL instance via Crossplane.
+                  When set, DB env vars in the deployment are sourced from the resulting
+                  connection secret instead of dbSecret.
+                properties:
+                  dbName:
+                    description: dbName is the name of the database to create
+                    type: string
+                  schema:
+                    description: schema is the optional inline schema to apply after
+                      the database is ready.
+                    properties:
+                      sql:
+                        description: sql is the inline SQL schema applied by the Atlas
+                          integration.
+                        type: string
+                    type: object
+                  size:
+                    default: small
+                    description: size is the RDS instance size preset.
+                    enum:
+                    - small
+                    - medium
+                    - large
+                    type: string
+                required:
+                - dbName
+                type: object
               dbSecret:
-                description: dbSecret is the name of the Secret containing the DB_PASSWORD
-                  key
+                description: |-
+                  dbSecret is the name of the Secret containing the DB_PASSWORD key.
+                  Used as the local postgres fallback when database is not set.
                 type: string
               extraEnv:
                 description: |-
@@ -256,7 +290,6 @@ spec:
                 description: tag is the container image tag to deploy
                 type: string
             required:
-            - dbSecret
             - image
             - tag
             type: object

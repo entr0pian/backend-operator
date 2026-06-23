@@ -55,6 +55,24 @@ rules:
   - patch
   - update
 - apiGroups:
+  - database.taskapp.io
+  resources:
+  - rdsinstances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - database.taskapp.io
+  resources:
+  - rdsinstances/status
+  verbs:
+  - get
+- apiGroups:
   - external-secrets.io
   resources:
   - externalsecrets

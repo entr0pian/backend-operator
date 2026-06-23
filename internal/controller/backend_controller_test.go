@@ -25,6 +25,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
 	appsv1alpha1 "github.com/entr0pian/taskapp-operator/api/v1alpha1"
@@ -87,6 +89,81 @@ var _ = Describe("Backend controller", func() {
 			}, timeout, interval).Should(Succeed())
 
 			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(80)))
+		})
+	})
+
+	Context("when a Backend CR requests a database", func() {
+		It("creates an RDSInstance claim and waits for it to become ready", func() {
+			backend := newBackend("rds-backend", ns)
+			backend.Spec.Database = &appsv1alpha1.DatabaseSpec{
+				DBName: "taskapp",
+				Size:   appsv1alpha1.DatabaseSizeMedium,
+			}
+			Expect(k8sClient.Create(ctx, backend)).To(Succeed())
+
+			rdsKey := types.NamespacedName{Name: "rds-backend", Namespace: ns}
+			deployKey := types.NamespacedName{Name: "rds-backend-backend", Namespace: ns}
+
+			By("checking the RDSInstance claim is created with mapped parameters")
+			rds := &unstructured.Unstructured{}
+			rds.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "database.taskapp.io",
+				Version: "v1alpha1",
+				Kind:    "RDSInstance",
+			})
+			Eventually(func() error {
+				return k8sClient.Get(ctx, rdsKey, rds)
+			}, timeout, interval).Should(Succeed())
+
+			dbName, _, _ := unstructured.NestedString(rds.Object, "spec", "parameters", "dbName")
+			instanceClass, _, _ := unstructured.NestedString(rds.Object, "spec", "parameters", "instanceClass")
+			storageGB, _, _ := unstructured.NestedInt64(rds.Object, "spec", "parameters", "storageGB")
+			Expect(dbName).To(Equal("taskapp"))
+			Expect(instanceClass).To(Equal("db.t3.small"))
+			Expect(storageGB).To(Equal(int64(50)))
+
+			By("checking deployment waits while RDS is not ready")
+			deploy := &appsv1.Deployment{}
+			Consistently(func() error {
+				return k8sClient.Get(ctx, deployKey, deploy)
+			}, 500*time.Millisecond, interval).ShouldNot(Succeed())
+
+			By("marking the RDSInstance claim ready")
+			Expect(unstructured.SetNestedSlice(rds.Object, []any{
+				map[string]any{
+					"type":   "Ready",
+					"status": "True",
+				},
+			}, "status", "conditions")).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, rds)).To(Succeed())
+
+			By("triggering a reconcile after RDS readiness changes")
+			updatedBackend := &appsv1alpha1.Backend{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "rds-backend", Namespace: ns}, updatedBackend)).To(Succeed())
+			if updatedBackend.Annotations == nil {
+				updatedBackend.Annotations = map[string]string{}
+			}
+			updatedBackend.Annotations["test.taskapp.io/rds-ready"] = "true"
+			Expect(k8sClient.Update(ctx, updatedBackend)).To(Succeed())
+
+			By("checking the Deployment is created after RDS is ready")
+			Eventually(func() error {
+				return k8sClient.Get(ctx, deployKey, deploy)
+			}, timeout, interval).Should(Succeed())
+
+			By("checking the Backend RDSReady condition is true")
+			Eventually(func() metav1.ConditionStatus {
+				updated := &appsv1alpha1.Backend{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "rds-backend", Namespace: ns}, updated); err != nil {
+					return metav1.ConditionUnknown
+				}
+				for _, cond := range updated.Status.Conditions {
+					if cond.Type == "RDSReady" {
+						return cond.Status
+					}
+				}
+				return metav1.ConditionUnknown
+			}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 		})
 	})
 

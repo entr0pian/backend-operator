@@ -1,19 +1,19 @@
 apiVersion: apps.taskapp.io/v1alpha1
 kind: Backend
 metadata:
-  name: backend
+  name: personal-backend
   labels:
-    app.kubernetes.io/name: backend
+    app.kubernetes.io/name: personal-backend
     app.kubernetes.io/managed-by: taskapp-operator
 spec:
   image: boicotaz/taskapp-backend
   tag: latest
   replicas: 1
   dbSecret: taskapp-database-secret
-  queue:
-    type: standard
-    deadLetter: false
+  database:
+    dbName: taskapp
+    size: small
+#  queue:
+#    type: standard
+#    deadLetter: false
     # urlEnvVar: SQS_QUEUE_URL   # optional — override the env var name injected into the container
-  extraEnv:
-    - name: AWS_REGION
-      value: eu-west-1
