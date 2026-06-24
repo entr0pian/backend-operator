@@ -213,6 +213,14 @@ func (r *BackendReconciler) reconcileRDS(ctx context.Context, backend *appsv1alp
 		"apps.taskapp.io/owned-by-namespace": backend.Namespace,
 	})
 
+	// Pin the XR name to {namespace}-{name} so all Crossplane-derived resource
+	// names (AWS RDS identifier, connection secret) are deterministic. Without
+	// this Crossplane appends a random suffix to the cluster-scoped XR name,
+	// making the connection secret name unpredictable at runtime.
+	if err := unstructured.SetNestedField(desired.Object, rdsXRName(backend), "spec", "resourceRef", "name"); err != nil {
+		return false, err
+	}
+
 	parameters := rdsParameters(backend.Spec.Database)
 	if err := unstructured.SetNestedField(desired.Object, parameters, "spec", "parameters"); err != nil {
 		return false, err
@@ -834,6 +842,17 @@ func (r *BackendReconciler) buildService(backend *appsv1alpha1.Backend) *corev1.
 func deploymentName(b *appsv1alpha1.Backend) string  { return b.Name + "-backend" }
 func serviceName(b *appsv1alpha1.Backend) string     { return b.Name + "-backend" }
 func rdsInstanceName(b *appsv1alpha1.Backend) string { return b.Name }
+
+// rdsXRName is the pinned cluster-scoped XR name for the Backend's RDS claim.
+// Namespace-qualified to avoid collisions when multiple namespaces use the same Backend name.
+func rdsXRName(b *appsv1alpha1.Backend) string { return b.Namespace + "-" + b.Name }
+
+// rdsConnectionSecretName is the deterministic name of the connection secret
+// the composition writes into the Backend's namespace. Derived from rdsXRName
+// via the composition's "%s-database-connection-details" pattern.
+func rdsConnectionSecretName(b *appsv1alpha1.Backend) string {
+	return rdsXRName(b) + "-database-connection-details"
+}
 
 func rdsParameters(db *appsv1alpha1.DatabaseSpec) map[string]any {
 	// Always materialize instanceClass and storageGB, even for small, using
