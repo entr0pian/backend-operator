@@ -836,8 +836,14 @@ func serviceName(b *appsv1alpha1.Backend) string     { return b.Name + "-backend
 func rdsInstanceName(b *appsv1alpha1.Backend) string { return b.Name }
 
 func rdsParameters(db *appsv1alpha1.DatabaseSpec) map[string]any {
+	// Always materialize instanceClass and storageGB, even for small, using
+	// values that mirror the XRD defaults. This keeps desired stable after
+	// Crossplane injects those defaults, so rdsParametersDrifted never sees
+	// spurious drift on small instances.
 	parameters := map[string]any{
-		"dbName": db.DBName,
+		"dbName":        db.DBName,
+		"instanceClass": "db.t3.micro",
+		"storageGB":     int64(20),
 	}
 	switch db.Size {
 	case appsv1alpha1.DatabaseSizeMedium:
