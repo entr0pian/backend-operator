@@ -217,7 +217,12 @@ func (r *BackendReconciler) reconcileRDS(ctx context.Context, backend *appsv1alp
 	// names (AWS RDS identifier, connection secret) are deterministic. Without
 	// this Crossplane appends a random suffix to the cluster-scoped XR name,
 	// making the connection secret name unpredictable at runtime.
-	if err := unstructured.SetNestedField(desired.Object, rdsXRName(backend), "spec", "resourceRef", "name"); err != nil {
+	// All three resourceRef fields are required by Crossplane's claim validation.
+	if err := unstructured.SetNestedField(desired.Object, map[string]any{
+		"apiVersion": rdsInstanceGVK.Group + "/" + rdsInstanceGVK.Version,
+		"kind":       "XRDSInstance",
+		"name":       rdsXRName(backend),
+	}, "spec", "resourceRef"); err != nil {
 		return false, err
 	}
 
