@@ -850,12 +850,18 @@ func rdsParameters(db *appsv1alpha1.DatabaseSpec) map[string]any {
 	return parameters
 }
 
-// rdsParametersDrifted reports whether any key in desired differs from the
-// corresponding key in existing. Extra keys in existing (XRD-injected defaults)
-// are intentionally ignored so they don't trigger a spurious patch every reconcile.
+// rdsOperatorOwnedKeys is the complete set of spec.parameters keys that
+// rdsParameters() may set or omit. Comparing exactly these keys ignores
+// XRD-injected fields (region, subnetIds, vpcId, …) while still detecting
+// removals — e.g. instanceClass going away when size reverts to small.
+var rdsOperatorOwnedKeys = []string{"dbName", "instanceClass", "storageGB"}
+
+// rdsParametersDrifted reports whether any operator-owned parameter key
+// differs between existing and desired. Keys injected by the XRD that the
+// operator never sets are intentionally ignored.
 func rdsParametersDrifted(existing, desired map[string]any) bool {
-	for k, v := range desired {
-		if !equality.Semantic.DeepEqual(existing[k], v) {
+	for _, k := range rdsOperatorOwnedKeys {
+		if !equality.Semantic.DeepEqual(existing[k], desired[k]) {
 			return true
 		}
 	}
