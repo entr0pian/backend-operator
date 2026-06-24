@@ -852,7 +852,6 @@ func rdsInstanceName(b *appsv1alpha1.Backend) string { return b.Name }
 // Namespace-qualified to avoid collisions when multiple namespaces use the same Backend name.
 func rdsXRName(b *appsv1alpha1.Backend) string { return b.Namespace + "-" + b.Name }
 
-
 func rdsParameters(db *appsv1alpha1.DatabaseSpec) map[string]any {
 	// Always materialize instanceClass and storageGB, even for small, using
 	// values that mirror the XRD defaults. This keeps desired stable after
