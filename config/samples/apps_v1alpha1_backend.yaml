@@ -1,14 +1,16 @@
 apiVersion: apps.taskapp.io/v1alpha1
 kind: Backend
 metadata:
-  name: personal-backend
+  name: taskapp
   labels:
-    app.kubernetes.io/name: personal-backend
+    app.kubernetes.io/name: taskapp
     app.kubernetes.io/managed-by: taskapp-operator
 spec:
   image: boicotaz/taskapp-backend
   tag: latest
   replicas: 1
+  # dbSecret is required until PR 2 wires buildDeployment() to the RDS connection secret.
+  # Without it the pod references a secret named "" and fails to start.
   dbSecret: taskapp-database-secret
   database:
     dbName: taskapp
@@ -16,4 +18,4 @@ spec:
 #  queue:
 #    type: standard
 #    deadLetter: false
-    # urlEnvVar: SQS_QUEUE_URL   # optional — override the env var name injected into the container
+#    urlEnvVar: SQS_QUEUE_URL

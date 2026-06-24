@@ -240,7 +240,7 @@ func (r *BackendReconciler) reconcileRDS(ctx context.Context, backend *appsv1alp
 	}
 
 	existingParameters, _, _ := unstructured.NestedMap(existing.Object, "spec", "parameters")
-	if !equality.Semantic.DeepEqual(existingParameters, parameters) {
+	if rdsParametersDrifted(existingParameters, parameters) {
 		patch := client.MergeFrom(existing.DeepCopy())
 		if err := unstructured.SetNestedField(existing.Object, parameters, "spec", "parameters"); err != nil {
 			return false, err
@@ -848,6 +848,18 @@ func rdsParameters(db *appsv1alpha1.DatabaseSpec) map[string]any {
 		parameters["storageGB"] = int64(100)
 	}
 	return parameters
+}
+
+// rdsParametersDrifted reports whether any key in desired differs from the
+// corresponding key in existing. Extra keys in existing (XRD-injected defaults)
+// are intentionally ignored so they don't trigger a spurious patch every reconcile.
+func rdsParametersDrifted(existing, desired map[string]any) bool {
+	for k, v := range desired {
+		if !equality.Semantic.DeepEqual(existing[k], v) {
+			return true
+		}
+	}
+	return false
 }
 
 func sqsQueueName(b *appsv1alpha1.Backend) string {
