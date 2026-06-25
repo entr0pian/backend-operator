@@ -388,7 +388,8 @@ func (r *BackendReconciler) reconcileSchema(ctx context.Context, backend *appsv1
 	}
 
 	existingSQL, _, _ := unstructured.NestedString(existing.Object, "spec", "schema", "sql")
-	if existingSQL != backend.Spec.Database.Schema.SQL {
+	existingDB, _, _ := unstructured.NestedString(existing.Object, "spec", "credentials", "database")
+	if existingSQL != backend.Spec.Database.Schema.SQL || existingDB != backend.Spec.Database.DBName {
 		patch := client.MergeFrom(existing.DeepCopy())
 		if err := unstructured.SetNestedField(existing.Object, spec, "spec"); err != nil {
 			return false, err
@@ -397,7 +398,7 @@ func (r *BackendReconciler) reconcileSchema(ctx context.Context, backend *appsv1
 			return false, err
 		}
 		log.Info("patched AtlasSchema", "name", name)
-		r.setSchemaReadyCondition(backend, metav1.ConditionFalse, "SchemaApplying", "SQL changed, waiting for Atlas to re-apply")
+		r.setSchemaReadyCondition(backend, metav1.ConditionFalse, "SchemaApplying", "spec changed, waiting for Atlas to re-apply")
 		return true, nil
 	}
 
