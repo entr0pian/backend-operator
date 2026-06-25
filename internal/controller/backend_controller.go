@@ -897,6 +897,7 @@ func (r *BackendReconciler) buildDeployment(backend *appsv1alpha1.Backend, queue
 			secretKeyRefEnv("DB_USER", conn, "username"),
 			secretKeyRefEnv("DB_PASSWORD", conn, "password"),
 			secretKeyRefEnv("DB_NAME", conn, "dbname"),
+			{Name: "DB_SSLMODE", Value: "require"},
 		}
 	} else {
 		envVars = []corev1.EnvVar{
