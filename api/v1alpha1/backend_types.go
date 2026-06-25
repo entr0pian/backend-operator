@@ -48,6 +48,39 @@ type QueueSpec struct {
 	URLEnvVar string `json:"urlEnvVar,omitempty"`
 }
 
+// DatabaseSize defines the provisioned RDS instance size preset.
+// +kubebuilder:validation:Enum=small;medium;large
+type DatabaseSize string
+
+const (
+	DatabaseSizeSmall  DatabaseSize = "small"
+	DatabaseSizeMedium DatabaseSize = "medium"
+	DatabaseSizeLarge  DatabaseSize = "large"
+)
+
+// SchemaSpec defines an optional inline schema for a provisioned database.
+type SchemaSpec struct {
+	// sql is the inline SQL schema applied by the Atlas integration.
+	// +optional
+	SQL string `json:"sql,omitempty"`
+}
+
+// DatabaseSpec defines the RDS database desired by the Backend
+type DatabaseSpec struct {
+	// dbName is the name of the database to create
+	// +kubebuilder:validation:Required
+	DBName string `json:"dbName"`
+
+	// size is the RDS instance size preset.
+	// +kubebuilder:default=small
+	// +optional
+	Size DatabaseSize `json:"size,omitempty"`
+
+	// schema is the optional inline schema to apply after the database is ready.
+	// +optional
+	Schema *SchemaSpec `json:"schema,omitempty"`
+}
+
 // BackendSpec defines the desired state of Backend
 type BackendSpec struct {
 	// image is the container image repository (e.g. boicotaz/taskapp-backend)
@@ -63,9 +96,16 @@ type BackendSpec struct {
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// dbSecret is the name of the Secret containing the DB_PASSWORD key
-	// +kubebuilder:validation:Required
-	DBSecret string `json:"dbSecret"`
+	// dbSecret is the name of the Secret containing the DB_PASSWORD key.
+	// Used as the local postgres fallback when database is not set.
+	// +optional
+	DBSecret string `json:"dbSecret,omitempty"`
+
+	// database optionally provisions an RDS PostgreSQL instance via Crossplane.
+	// When set, DB env vars in the deployment are sourced from the resulting
+	// connection secret instead of dbSecret.
+	// +optional
+	Database *DatabaseSpec `json:"database,omitempty"`
 
 	// queue optionally provisions an SQS queue for this Backend.
 	// Omit the field entirely if no queue is needed.
@@ -101,6 +141,7 @@ type BackendStatus struct {
 // +kubebuilder:printcolumn:name="Tag",type=string,JSONPath=`.spec.tag`
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
+// +kubebuilder:printcolumn:name="RDSReady",type=string,JSONPath=`.status.conditions[?(@.type=="RDSReady")].status`,priority=1
 // +kubebuilder:printcolumn:name="QueueURL",type=string,JSONPath=`.status.queueURL`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

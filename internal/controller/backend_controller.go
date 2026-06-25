@@ -58,6 +58,12 @@ var externalSecretGVK = schema.GroupVersionKind{
 	Kind:    "ExternalSecret",
 }
 
+var rdsInstanceGVK = schema.GroupVersionKind{
+	Group:   "database.taskapp.io",
+	Version: "v1alpha1",
+	Kind:    "RDSInstance",
+}
+
 // BackendReconciler reconciles a Backend object
 type BackendReconciler struct {
 	client.Client
@@ -73,6 +79,8 @@ type BackendReconciler struct {
 // +kubebuilder:rbac:groups=sqs.aws.upbound.io,resources=queues,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=sqs.aws.upbound.io,resources=queues/status,verbs=get
 // +kubebuilder:rbac:groups=external-secrets.io,resources=externalsecrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=database.taskapp.io,resources=rdsinstances,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=database.taskapp.io,resources=rdsinstances/status,verbs=get
 
 func (r *BackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -96,6 +104,20 @@ func (r *BackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
+	}
+
+	statusBase := backend.DeepCopy()
+	if requeue, err := r.reconcileRDS(ctx, backend); err != nil {
+		log.Error(err, "failed to reconcile RDSInstance")
+		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+		return ctrl.Result{}, err
+	} else if requeue {
+		if err := r.patchStatusIfChanged(ctx, statusBase, backend); err != nil {
+			log.Error(err, "failed to update status")
+			r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
 	if err := r.reconcileExternalSecret(ctx, backend); err != nil {
@@ -127,7 +149,7 @@ func (r *BackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	if err := r.updateStatus(ctx, backend, queueURL); err != nil {
+	if err := r.updateStatus(ctx, statusBase, backend, queueURL); err != nil {
 		log.Error(err, "failed to update status")
 		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
 		return ctrl.Result{}, err
@@ -168,6 +190,118 @@ func (r *BackendReconciler) reconcileSQS(ctx context.Context, backend *appsv1alp
 		return "", true, nil
 	}
 	return url, false, nil
+}
+
+func (r *BackendReconciler) reconcileRDS(ctx context.Context, backend *appsv1alpha1.Backend) (bool, error) {
+	log := logf.FromContext(ctx)
+
+	if backend.Spec.Database == nil {
+		log.Info("database spec removed, deleting owned RDS instances")
+		if err := r.deleteRDS(ctx, backend); err != nil {
+			return false, err
+		}
+		backend.Status.Conditions = removeCondition(backend.Status.Conditions, "RDSReady")
+		return false, nil
+	}
+
+	desired := &unstructured.Unstructured{}
+	desired.SetGroupVersionKind(rdsInstanceGVK)
+	desired.SetName(rdsInstanceName(backend))
+	desired.SetNamespace(backend.Namespace)
+	desired.SetLabels(map[string]string{
+		"apps.taskapp.io/owned-by-backend":   backend.Name,
+		"apps.taskapp.io/owned-by-namespace": backend.Namespace,
+	})
+
+	// Pin the XR name to {namespace}-{name} so all Crossplane-derived resource
+	// names (AWS RDS identifier, connection secret) are deterministic. Without
+	// this Crossplane appends a random suffix to the cluster-scoped XR name,
+	// making the connection secret name unpredictable at runtime.
+	// All three resourceRef fields are required by Crossplane's claim validation.
+	if err := unstructured.SetNestedField(desired.Object, map[string]any{
+		"apiVersion": rdsInstanceGVK.Group + "/" + rdsInstanceGVK.Version,
+		"kind":       "XRDSInstance",
+		"name":       rdsXRName(backend),
+	}, "spec", "resourceRef"); err != nil {
+		return false, err
+	}
+
+	parameters := rdsParameters(backend.Spec.Database)
+	if err := unstructured.SetNestedField(desired.Object, parameters, "spec", "parameters"); err != nil {
+		return false, err
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(rdsInstanceGVK)
+	err := r.Get(ctx, types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}, existing)
+	if errors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return false, err
+		}
+		log.Info("created RDSInstance", "rdsinstance", desired.GetName())
+		r.Recorder.Event(backend, corev1.EventTypeNormal, "RDSInstanceCreated", fmt.Sprintf("Created RDSInstance %s", desired.GetName()))
+		r.setRDSReadyCondition(backend, metav1.ConditionFalse, "RDSProvisioning", "created RDSInstance claim and waiting for readiness")
+		return true, nil
+	}
+	if apimeta.IsNoMatchError(err) {
+		log.Info("RDSInstance CRD not yet installed, skipping")
+		r.setRDSReadyCondition(backend, metav1.ConditionFalse, "RDSInstanceCRDNotInstalled", "waiting for RDSInstance CRD to be installed")
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	existingParameters, _, _ := unstructured.NestedMap(existing.Object, "spec", "parameters")
+	if rdsParametersDrifted(existingParameters, parameters) {
+		patch := client.MergeFrom(existing.DeepCopy())
+		if err := unstructured.SetNestedField(existing.Object, parameters, "spec", "parameters"); err != nil {
+			return false, err
+		}
+		existing.SetLabels(desired.GetLabels())
+		if err := r.Patch(ctx, existing, patch); err != nil {
+			return false, err
+		}
+		log.Info("patched RDSInstance", "rdsinstance", existing.GetName())
+	}
+
+	if !isReady(existing) {
+		log.Info("RDSInstance not yet ready, requeueing", "rdsinstance", existing.GetName())
+		r.setRDSReadyCondition(backend, metav1.ConditionFalse, "RDSProvisioning", "waiting for RDSInstance claim to become ready")
+		return true, nil
+	}
+
+	log.Info("RDSInstance ready", "rdsinstance", existing.GetName())
+	r.setRDSReadyCondition(backend, metav1.ConditionTrue, "RDSReady", "RDSInstance claim is ready")
+	return false, nil
+}
+
+func (r *BackendReconciler) deleteRDS(ctx context.Context, backend *appsv1alpha1.Backend) error {
+	log := logf.FromContext(ctx)
+
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   rdsInstanceGVK.Group,
+		Version: rdsInstanceGVK.Version,
+		Kind:    "RDSInstanceList",
+	})
+	if err := r.List(ctx, list, client.InNamespace(backend.Namespace), client.MatchingLabels{
+		"apps.taskapp.io/owned-by-backend":   backend.Name,
+		"apps.taskapp.io/owned-by-namespace": backend.Namespace,
+	}); err != nil {
+		if apimeta.IsNoMatchError(err) {
+			log.Info("RDSInstance CRD not yet installed, skipping RDS cleanup")
+			return nil
+		}
+		return err
+	}
+	for i := range list.Items {
+		if err := client.IgnoreNotFound(r.Delete(ctx, &list.Items[i])); err != nil {
+			return err
+		}
+		log.Info("deleted owned RDSInstance", "rdsinstance", list.Items[i].GetName())
+	}
+	return nil
 }
 
 // reconcileQueue ensures a single Crossplane Queue CR exists with the given name.
@@ -379,6 +513,9 @@ func (r *BackendReconciler) handleDeletion(ctx context.Context, backend *appsv1a
 	if err := r.deleteQueue(ctx, backend); err != nil {
 		return err
 	}
+	if err := r.deleteRDS(ctx, backend); err != nil {
+		return err
+	}
 
 	log.Info("finalizer removed, deletion complete")
 	controllerutil.RemoveFinalizer(backend, backendFinalizer)
@@ -484,13 +621,11 @@ func (r *BackendReconciler) reconcileService(ctx context.Context, backend *appsv
 	return nil
 }
 
-func (r *BackendReconciler) updateStatus(ctx context.Context, backend *appsv1alpha1.Backend, queueURL string) error {
+func (r *BackendReconciler) updateStatus(ctx context.Context, statusBase, backend *appsv1alpha1.Backend, queueURL string) error {
 	deploy := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Name: deploymentName(backend), Namespace: backend.Namespace}, deploy); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-
-	patch := client.MergeFrom(backend.DeepCopy())
 
 	backend.Status.ReadyReplicas = deploy.Status.ReadyReplicas
 	backend.Status.QueueURL = queueURL
@@ -539,6 +674,29 @@ func (r *BackendReconciler) updateStatus(ctx context.Context, backend *appsv1alp
 		backend.Status.Conditions = removeCondition(backend.Status.Conditions, "SQSReady")
 	}
 
+	if backend.Spec.Database == nil {
+		backend.Status.Conditions = removeCondition(backend.Status.Conditions, "RDSReady")
+	}
+
+	return r.patchStatusIfChanged(ctx, statusBase, backend)
+}
+
+func (r *BackendReconciler) setRDSReadyCondition(backend *appsv1alpha1.Backend, status metav1.ConditionStatus, reason, message string) {
+	r.setCondition(backend, metav1.Condition{
+		Type:               "RDSReady",
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: backend.Generation,
+		LastTransitionTime: metav1.Now(),
+	})
+}
+
+func (r *BackendReconciler) patchStatusIfChanged(ctx context.Context, statusBase, backend *appsv1alpha1.Backend) error {
+	if equality.Semantic.DeepEqual(statusBase.Status, backend.Status) {
+		return nil
+	}
+	patch := client.MergeFrom(statusBase)
 	return client.IgnoreNotFound(r.Status().Patch(ctx, backend, patch))
 }
 
@@ -547,7 +705,7 @@ func (r *BackendReconciler) setCondition(backend *appsv1alpha1.Backend, cond met
 	if existing != nil {
 		if existing.Status != cond.Status {
 			existing.LastTransitionTime = metav1.Now()
-			if cond.Type == "Available" {
+			if cond.Type == "Available" || cond.Type == "RDSReady" {
 				if cond.Status == metav1.ConditionFalse {
 					r.Recorder.Event(backend, corev1.EventTypeWarning, cond.Reason, cond.Message)
 				} else {
@@ -686,8 +844,52 @@ func (r *BackendReconciler) buildService(backend *appsv1alpha1.Backend) *corev1.
 	}
 }
 
-func deploymentName(b *appsv1alpha1.Backend) string { return b.Name + "-backend" }
-func serviceName(b *appsv1alpha1.Backend) string    { return b.Name + "-backend" }
+func deploymentName(b *appsv1alpha1.Backend) string  { return b.Name + "-backend" }
+func serviceName(b *appsv1alpha1.Backend) string     { return b.Name + "-backend" }
+func rdsInstanceName(b *appsv1alpha1.Backend) string { return b.Name }
+
+// rdsXRName is the pinned cluster-scoped XR name for the Backend's RDS claim.
+// Namespace-qualified to avoid collisions when multiple namespaces use the same Backend name.
+func rdsXRName(b *appsv1alpha1.Backend) string { return b.Namespace + "-" + b.Name }
+
+func rdsParameters(db *appsv1alpha1.DatabaseSpec) map[string]any {
+	// Always materialize instanceClass and storageGB, even for small, using
+	// values that mirror the XRD defaults. This keeps desired stable after
+	// Crossplane injects those defaults, so rdsParametersDrifted never sees
+	// spurious drift on small instances.
+	parameters := map[string]any{
+		"dbName":        db.DBName,
+		"instanceClass": "db.t3.micro",
+		"storageGB":     int64(20),
+	}
+	switch db.Size {
+	case appsv1alpha1.DatabaseSizeMedium:
+		parameters["instanceClass"] = "db.t3.small"
+		parameters["storageGB"] = int64(50)
+	case appsv1alpha1.DatabaseSizeLarge:
+		parameters["instanceClass"] = "db.t3.medium"
+		parameters["storageGB"] = int64(100)
+	}
+	return parameters
+}
+
+// rdsOperatorOwnedKeys is the complete set of spec.parameters keys that
+// rdsParameters() may set or omit. Comparing exactly these keys ignores
+// XRD-injected fields (region, subnetIds, vpcId, …) while still detecting
+// removals — e.g. instanceClass going away when size reverts to small.
+var rdsOperatorOwnedKeys = []string{"dbName", "instanceClass", "storageGB"}
+
+// rdsParametersDrifted reports whether any operator-owned parameter key
+// differs between existing and desired. Keys injected by the XRD that the
+// operator never sets are intentionally ignored.
+func rdsParametersDrifted(existing, desired map[string]any) bool {
+	for _, k := range rdsOperatorOwnedKeys {
+		if !equality.Semantic.DeepEqual(existing[k], desired[k]) {
+			return true
+		}
+	}
+	return false
+}
 
 func sqsQueueName(b *appsv1alpha1.Backend) string {
 	name := b.Namespace + "-" + b.Name + "-queue"
@@ -743,6 +945,20 @@ func removeCondition(conditions []metav1.Condition, condType string) []metav1.Co
 		}
 	}
 	return result
+}
+
+func isReady(obj *unstructured.Unstructured) bool {
+	conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	for _, c := range conditions {
+		cond, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if cond["type"] == "Ready" && cond["status"] == "True" {
+			return true
+		}
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
