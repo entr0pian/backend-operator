@@ -33,8 +33,8 @@ import (
 )
 
 const (
-	timeout      = 10 * time.Second
-	interval     = 250 * time.Millisecond
+	timeout        = 10 * time.Second
+	interval       = 250 * time.Millisecond
 	annotationTrue = "true"
 )
 
