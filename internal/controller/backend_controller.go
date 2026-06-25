@@ -397,6 +397,8 @@ func (r *BackendReconciler) reconcileSchema(ctx context.Context, backend *appsv1
 			return false, err
 		}
 		log.Info("patched AtlasSchema", "name", name)
+		r.setSchemaReadyCondition(backend, metav1.ConditionFalse, "SchemaApplying", "SQL changed, waiting for Atlas to re-apply")
+		return true, nil
 	}
 
 	if !isReady(existing) {
