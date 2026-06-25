@@ -167,6 +167,95 @@ var _ = Describe("Backend controller", func() {
 		})
 	})
 
+	Context("when a Backend CR requests a database with a schema", func() {
+		It("creates an AtlasSchema after RDS is ready and sets SchemaReady condition", func() {
+			backend := newBackend("schema-backend", ns)
+			backend.Spec.Database = &appsv1alpha1.DatabaseSpec{
+				DBName: "taskapp",
+				Schema: &appsv1alpha1.SchemaSpec{
+					SQL: "CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY);",
+				},
+			}
+			Expect(k8sClient.Create(ctx, backend)).To(Succeed())
+
+			rdsKey := types.NamespacedName{Name: "schema-backend", Namespace: ns}
+			schemaKey := types.NamespacedName{Name: "schema-backend-schema", Namespace: ns}
+
+			By("waiting for the RDSInstance to be created")
+			rds := &unstructured.Unstructured{}
+			rds.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "database.taskapp.io",
+				Version: "v1alpha1",
+				Kind:    "RDSInstance",
+			})
+			Eventually(func() error {
+				return k8sClient.Get(ctx, rdsKey, rds)
+			}, timeout, interval).Should(Succeed())
+
+			By("checking AtlasSchema is not created while RDS is pending")
+			atlasSchema := &unstructured.Unstructured{}
+			atlasSchema.SetGroupVersionKind(schema.GroupVersionKind{
+				Group:   "db.atlasgo.io",
+				Version: "v1alpha1",
+				Kind:    "AtlasSchema",
+			})
+			Consistently(func() error {
+				return k8sClient.Get(ctx, schemaKey, atlasSchema)
+			}, 500*time.Millisecond, interval).ShouldNot(Succeed())
+
+			By("marking the RDSInstance ready")
+			Expect(unstructured.SetNestedSlice(rds.Object, []any{
+				map[string]any{"type": "Ready", "status": "True"},
+			}, "status", "conditions")).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, rds)).To(Succeed())
+
+			By("triggering a reconcile after RDS readiness changes")
+			updatedBackend := &appsv1alpha1.Backend{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "schema-backend", Namespace: ns}, updatedBackend)).To(Succeed())
+			if updatedBackend.Annotations == nil {
+				updatedBackend.Annotations = map[string]string{}
+			}
+			updatedBackend.Annotations["test.taskapp.io/rds-ready"] = "true"
+			Expect(k8sClient.Update(ctx, updatedBackend)).To(Succeed())
+
+			By("checking the AtlasSchema is created with correct spec")
+			Eventually(func() error {
+				return k8sClient.Get(ctx, schemaKey, atlasSchema)
+			}, timeout, interval).Should(Succeed())
+
+			sql, _, _ := unstructured.NestedString(atlasSchema.Object, "spec", "schema", "sql")
+			Expect(sql).To(Equal("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY);"))
+
+			dbName, _, _ := unstructured.NestedString(atlasSchema.Object, "spec", "credentials", "database")
+			Expect(dbName).To(Equal("taskapp"))
+
+			By("marking the AtlasSchema ready")
+			Expect(unstructured.SetNestedSlice(atlasSchema.Object, []any{
+				map[string]any{"type": "Ready", "status": "True"},
+			}, "status", "conditions")).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, atlasSchema)).To(Succeed())
+
+			By("triggering a reconcile after AtlasSchema readiness changes")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "schema-backend", Namespace: ns}, updatedBackend)).To(Succeed())
+			updatedBackend.Annotations["test.taskapp.io/schema-ready"] = "true"
+			Expect(k8sClient.Update(ctx, updatedBackend)).To(Succeed())
+
+			By("checking the SchemaReady condition is true")
+			Eventually(func() metav1.ConditionStatus {
+				updated := &appsv1alpha1.Backend{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "schema-backend", Namespace: ns}, updated); err != nil {
+					return metav1.ConditionUnknown
+				}
+				for _, cond := range updated.Status.Conditions {
+					if cond.Type == "SchemaReady" {
+						return cond.Status
+					}
+				}
+				return metav1.ConditionUnknown
+			}, timeout, interval).Should(Equal(metav1.ConditionTrue))
+		})
+	})
+
 	Context("when the image tag is updated", func() {
 		It("updates the Deployment image", func() {
 			backend := newBackend("update-backend", ns)
