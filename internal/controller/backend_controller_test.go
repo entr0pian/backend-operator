@@ -33,8 +33,9 @@ import (
 )
 
 const (
-	timeout  = 10 * time.Second
-	interval = 250 * time.Millisecond
+	timeout      = 10 * time.Second
+	interval     = 250 * time.Millisecond
+	annotationTrue = "true"
 )
 
 func newBackend(name, namespace string) *appsv1alpha1.Backend {
@@ -143,7 +144,7 @@ var _ = Describe("Backend controller", func() {
 			if updatedBackend.Annotations == nil {
 				updatedBackend.Annotations = map[string]string{}
 			}
-			updatedBackend.Annotations["test.taskapp.io/rds-ready"] = "true"
+			updatedBackend.Annotations["test.taskapp.io/rds-ready"] = annotationTrue
 			Expect(k8sClient.Update(ctx, updatedBackend)).To(Succeed())
 
 			By("checking the Deployment is created after RDS is ready")
@@ -215,7 +216,7 @@ var _ = Describe("Backend controller", func() {
 			if updatedBackend.Annotations == nil {
 				updatedBackend.Annotations = map[string]string{}
 			}
-			updatedBackend.Annotations["test.taskapp.io/rds-ready"] = "true"
+			updatedBackend.Annotations["test.taskapp.io/rds-ready"] = annotationTrue
 			Expect(k8sClient.Update(ctx, updatedBackend)).To(Succeed())
 
 			By("checking the AtlasSchema is created with correct spec")
@@ -237,7 +238,7 @@ var _ = Describe("Backend controller", func() {
 
 			By("triggering a reconcile after AtlasSchema readiness changes")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "schema-backend", Namespace: ns}, updatedBackend)).To(Succeed())
-			updatedBackend.Annotations["test.taskapp.io/schema-ready"] = "true"
+			updatedBackend.Annotations["test.taskapp.io/schema-ready"] = annotationTrue
 			Expect(k8sClient.Update(ctx, updatedBackend)).To(Succeed())
 
 			By("checking the SchemaReady condition is true")
