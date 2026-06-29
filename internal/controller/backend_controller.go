@@ -39,17 +39,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	appsv1alpha1 "github.com/entr0pian/taskapp-operator/api/v1alpha1"
 )
 
 const backendFinalizer = "apps.taskapp.io/finalizer"
 
-var sqsQueueGVK = schema.GroupVersionKind{
-	Group:   "sqs.aws.upbound.io",
-	Version: "v1beta1",
-	Kind:    "Queue",
+var sqsClaimGVK = schema.GroupVersionKind{
+	Group:   "queue.taskapp.io",
+	Version: "v1alpha1",
+	Kind:    "SQSQueue",
 }
 
 var externalSecretGVK = schema.GroupVersionKind{
@@ -82,8 +81,8 @@ type BackendReconciler struct {
 // +kubebuilder:rbac:groups=apps.taskapp.io,resources=backends/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=sqs.aws.upbound.io,resources=queues,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=sqs.aws.upbound.io,resources=queues/status,verbs=get
+// +kubebuilder:rbac:groups=queue.taskapp.io,resources=sqsqueues,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=queue.taskapp.io,resources=sqsqueues/status,verbs=get
 // +kubebuilder:rbac:groups=external-secrets.io,resources=externalsecrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=database.taskapp.io,resources=rdsinstances,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=database.taskapp.io,resources=rdsinstances/status,verbs=get
@@ -452,108 +451,89 @@ func (r *BackendReconciler) setSchemaReadyCondition(backend *appsv1alpha1.Backen
 	})
 }
 
-// reconcileQueue ensures a single Crossplane Queue CR exists with the given name.
-// Set returnARN=true when the caller needs the queue's ARN (DLQ calls, for use in
-// redrivePolicy); set returnARN=false to get the queue URL (main queue, for SQS_QUEUE_URL).
+// reconcileQueue ensures a single SQSQueue claim exists with the given name.
+// Set returnARN=true when the caller needs the queue's ARN (DLQ, for redrivePolicy);
+// set returnARN=false to get the queue URL (main queue, for SQS_QUEUE_URL).
 func (r *BackendReconciler) reconcileQueue(ctx context.Context, backend *appsv1alpha1.Backend, name, dlqARN string, fifo, returnARN bool) (string, bool, error) {
 	log := logf.FromContext(ctx)
 
 	desired := &unstructured.Unstructured{}
-	desired.SetGroupVersionKind(sqsQueueGVK)
+	desired.SetGroupVersionKind(sqsClaimGVK)
 	desired.SetName(name)
-	desired.SetLabels(map[string]string{
-		"apps.taskapp.io/owned-by-backend":   backend.Name,
-		"apps.taskapp.io/owned-by-namespace": backend.Namespace,
-	})
-
-	forProvider := map[string]any{
-		"name":   name,
-		"region": sqsRegion(),
-		"tags": map[string]any{
-			"managed-by": "taskapp-operator",
-		},
-	}
-	if fifo {
-		forProvider["fifoQueue"] = true
-	}
-	if dlqARN != "" {
-		forProvider["redrivePolicy"] = []any{
-			map[string]any{
-				"deadLetterTargetArn": dlqARN,
-				"maxReceiveCount":     5,
-			},
-		}
-	}
-
-	if err := unstructured.SetNestedField(desired.Object, forProvider, "spec", "forProvider"); err != nil {
+	desired.SetNamespace(backend.Namespace)
+	if err := ctrl.SetControllerReference(backend, desired, r.Scheme); err != nil {
 		return "", false, err
 	}
-	if err := unstructured.SetNestedField(desired.Object, "default", "spec", "providerConfigRef", "name"); err != nil {
+
+	// Pin XR name to the claim name so the AWS queue name (derived from XR
+	// metadata.name by the composition) is deterministic and matches the claim name.
+	if err := unstructured.SetNestedField(desired.Object, map[string]any{
+		"apiVersion": "queue.taskapp.io/v1alpha1",
+		"kind":       "XSQSQueue",
+		"name":       name,
+	}, "spec", "resourceRef"); err != nil {
+		return "", false, err
+	}
+
+	parameters := map[string]any{
+		"region": sqsRegion(),
+		"fifo":   fifo,
+	}
+	if dlqARN != "" {
+		parameters["deadLetterArn"] = dlqARN
+	}
+	if err := unstructured.SetNestedField(desired.Object, parameters, "spec", "parameters"); err != nil {
 		return "", false, err
 	}
 
 	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(sqsQueueGVK)
-	err := r.Get(ctx, types.NamespacedName{Name: name}, existing)
+	existing.SetGroupVersionKind(sqsClaimGVK)
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: backend.Namespace}, existing)
 	if errors.IsNotFound(err) {
 		if err := r.Create(ctx, desired); err != nil {
 			return "", false, err
 		}
-		log.Info("created queue", "queue", name)
-		r.Recorder.Event(backend, corev1.EventTypeNormal, "QueueCreated", fmt.Sprintf("Created Queue %s", name))
+		log.Info("created SQSQueue claim", "sqsqueue", name)
+		r.Recorder.Event(backend, corev1.EventTypeNormal, "QueueCreated", fmt.Sprintf("Created SQSQueue claim %s", name))
+		return "", true, nil
+	}
+	if apimeta.IsNoMatchError(err) {
+		log.Info("SQSQueue CRD not yet installed, skipping")
 		return "", true, nil
 	}
 	if err != nil {
 		return "", false, err
 	}
 
-	// Check Ready condition
-	conditions, _, _ := unstructured.NestedSlice(existing.Object, "status", "conditions")
-	ready := false
-	for _, c := range conditions {
-		cond, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if cond["type"] == "Ready" && cond["status"] == "True" {
-			ready = true
-			break
-		}
-	}
-	if !ready {
-		log.Info("queue not yet ready, requeueing", "queue", name)
+	if !isReady(existing) {
+		log.Info("SQSQueue claim not yet ready, requeueing", "sqsqueue", name)
 		return "", true, nil
 	}
 
-	log.Info("queue ready", "queue", name)
+	log.Info("SQSQueue claim ready", "sqsqueue", name)
 	if returnARN {
-		arn, _, _ := unstructured.NestedString(existing.Object, "status", "atProvider", "arn")
+		arn, _, _ := unstructured.NestedString(existing.Object, "status", "queueArn")
 		return arn, false, nil
 	}
-	url, _, _ := unstructured.NestedString(existing.Object, "status", "atProvider", "url")
+	url, _, _ := unstructured.NestedString(existing.Object, "status", "queueUrl")
 	return url, false, nil
 }
 
 func (r *BackendReconciler) deleteQueue(ctx context.Context, backend *appsv1alpha1.Backend) error {
 	log := logf.FromContext(ctx)
 
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   sqsQueueGVK.Group,
-		Version: sqsQueueGVK.Version,
-		Kind:    "QueueList",
-	})
-	if err := r.List(ctx, list, client.MatchingLabels{
-		"apps.taskapp.io/owned-by-backend":   backend.Name,
-		"apps.taskapp.io/owned-by-namespace": backend.Namespace,
-	}); err != nil {
-		return err
-	}
-	for i := range list.Items {
-		if err := client.IgnoreNotFound(r.Delete(ctx, &list.Items[i])); err != nil {
+	for _, name := range []string{sqsQueueName(backend), sqsDLQName(backend)} {
+		claim := &unstructured.Unstructured{}
+		claim.SetGroupVersionKind(sqsClaimGVK)
+		claim.SetName(name)
+		claim.SetNamespace(backend.Namespace)
+		err := r.Delete(ctx, claim)
+		if client.IgnoreNotFound(err) != nil {
 			return err
 		}
-		log.Info("deleted owned queue", "queue", list.Items[i].GetName())
+		if err == nil {
+			log.Info("deleted SQSQueue claim", "sqsqueue", name)
+		}
 	}
 	return nil
 }
@@ -1150,39 +1130,15 @@ func isReady(obj *unstructured.Unstructured) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	queueType := &unstructured.Unstructured{}
-	queueType.SetGroupVersionKind(sqsQueueGVK)
-
 	atlasSchemaType := &unstructured.Unstructured{}
 	atlasSchemaType.SetGroupVersionKind(atlasSchemaGVK)
-
-	rdsInstanceType := &unstructured.Unstructured{}
-	rdsInstanceType.SetGroupVersionKind(rdsInstanceGVK)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Backend{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Watches(
-			queueType,
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				labels := obj.GetLabels()
-				ns, nsOk := labels["apps.taskapp.io/owned-by-namespace"]
-				name, nameOk := labels["apps.taskapp.io/owned-by-backend"]
-				if !nsOk || !nameOk {
-					return nil
-				}
-				return []reconcile.Request{
-					{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}},
-				}
-			}),
-		).
-		Watches(
 			atlasSchemaType,
-			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.Backend{}),
-		).
-		Watches(
-			rdsInstanceType,
 			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.Backend{}),
 		).
 		Named("backend").
