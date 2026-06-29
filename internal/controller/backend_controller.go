@@ -64,6 +64,12 @@ var rdsInstanceGVK = schema.GroupVersionKind{
 	Kind:    "RDSInstance",
 }
 
+var atlasSchemaGVK = schema.GroupVersionKind{
+	Group:   "db.atlasgo.io",
+	Version: "v1alpha1",
+	Kind:    "AtlasSchema",
+}
+
 // BackendReconciler reconciles a Backend object
 type BackendReconciler struct {
 	client.Client
@@ -81,6 +87,8 @@ type BackendReconciler struct {
 // +kubebuilder:rbac:groups=external-secrets.io,resources=externalsecrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=database.taskapp.io,resources=rdsinstances,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=database.taskapp.io,resources=rdsinstances/status,verbs=get
+// +kubebuilder:rbac:groups=db.atlasgo.io,resources=atlasschemas,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=db.atlasgo.io,resources=atlasschemas/status,verbs=get
 
 func (r *BackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -109,6 +117,19 @@ func (r *BackendReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	statusBase := backend.DeepCopy()
 	if requeue, err := r.reconcileRDS(ctx, backend); err != nil {
 		log.Error(err, "failed to reconcile RDSInstance")
+		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+		return ctrl.Result{}, err
+	} else if requeue {
+		if err := r.patchStatusIfChanged(ctx, statusBase, backend); err != nil {
+			log.Error(err, "failed to update status")
+			r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	if requeue, err := r.reconcileSchema(ctx, backend); err != nil {
+		log.Error(err, "failed to reconcile AtlasSchema")
 		r.Recorder.Event(backend, corev1.EventTypeWarning, "ReconcileError", err.Error())
 		return ctrl.Result{}, err
 	} else if requeue {
@@ -302,6 +323,125 @@ func (r *BackendReconciler) deleteRDS(ctx context.Context, backend *appsv1alpha1
 		log.Info("deleted owned RDSInstance", "rdsinstance", list.Items[i].GetName())
 	}
 	return nil
+}
+
+func (r *BackendReconciler) reconcileSchema(ctx context.Context, backend *appsv1alpha1.Backend) (bool, error) {
+	log := logf.FromContext(ctx)
+
+	if backend.Spec.Database == nil || backend.Spec.Database.Schema == nil {
+		return false, r.deleteSchema(ctx, backend)
+	}
+
+	name := schemaName(backend)
+	connSecret := connSecretName(backend)
+
+	desired := &unstructured.Unstructured{}
+	desired.SetGroupVersionKind(atlasSchemaGVK)
+	desired.SetName(name)
+	desired.SetNamespace(backend.Namespace)
+	if err := ctrl.SetControllerReference(backend, desired, r.Scheme); err != nil {
+		return false, err
+	}
+
+	spec := map[string]any{
+		"credentials": map[string]any{
+			"scheme": "postgres",
+			"hostFrom": map[string]any{
+				"secretKeyRef": map[string]any{"name": connSecret, "key": "endpoint"},
+			},
+			"userFrom": map[string]any{
+				"secretKeyRef": map[string]any{"name": connSecret, "key": "username"},
+			},
+			"passwordFrom": map[string]any{
+				"secretKeyRef": map[string]any{"name": connSecret, "key": "password"},
+			},
+			"port":     int64(5432),
+			"database": backend.Spec.Database.DBName,
+		},
+		"schema": map[string]any{
+			"sql": backend.Spec.Database.Schema.SQL,
+		},
+	}
+	if err := unstructured.SetNestedField(desired.Object, spec, "spec"); err != nil {
+		return false, err
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(atlasSchemaGVK)
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: backend.Namespace}, existing)
+	if apimeta.IsNoMatchError(err) {
+		log.Info("AtlasSchema CRD not yet installed, skipping")
+		r.setSchemaReadyCondition(backend, metav1.ConditionFalse, "AtlasSchemaCRDNotInstalled", "waiting for AtlasSchema CRD to be installed")
+		return true, nil
+	}
+	if errors.IsNotFound(err) {
+		if err := r.Create(ctx, desired); err != nil {
+			return false, err
+		}
+		log.Info("created AtlasSchema", "name", name)
+		r.Recorder.Event(backend, corev1.EventTypeNormal, "AtlasSchemaCreated", fmt.Sprintf("Created AtlasSchema %s", name))
+		r.setSchemaReadyCondition(backend, metav1.ConditionFalse, "SchemaApplying", "created AtlasSchema and waiting for readiness")
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	existingSQL, _, _ := unstructured.NestedString(existing.Object, "spec", "schema", "sql")
+	existingDB, _, _ := unstructured.NestedString(existing.Object, "spec", "credentials", "database")
+	if existingSQL != backend.Spec.Database.Schema.SQL || existingDB != backend.Spec.Database.DBName {
+		patch := client.MergeFrom(existing.DeepCopy())
+		if err := unstructured.SetNestedField(existing.Object, spec, "spec"); err != nil {
+			return false, err
+		}
+		if err := r.Patch(ctx, existing, patch); err != nil {
+			return false, err
+		}
+		log.Info("patched AtlasSchema", "name", name)
+		r.setSchemaReadyCondition(backend, metav1.ConditionFalse, "SchemaApplying", "spec changed, waiting for Atlas to re-apply")
+		return true, nil
+	}
+
+	if !isReady(existing) {
+		log.Info("AtlasSchema not yet ready, requeueing", "name", name)
+		r.setSchemaReadyCondition(backend, metav1.ConditionFalse, "SchemaApplying", "waiting for AtlasSchema to become ready")
+		return true, nil
+	}
+
+	log.Info("AtlasSchema ready", "name", name)
+	r.setSchemaReadyCondition(backend, metav1.ConditionTrue, "SchemaReady", "AtlasSchema is ready")
+	return false, nil
+}
+
+func (r *BackendReconciler) deleteSchema(ctx context.Context, backend *appsv1alpha1.Backend) error {
+	log := logf.FromContext(ctx)
+	name := schemaName(backend)
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(atlasSchemaGVK)
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: backend.Namespace}, existing)
+	if errors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := r.Delete(ctx, existing); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	log.Info("deleted AtlasSchema", "name", name)
+	return nil
+}
+
+func (r *BackendReconciler) setSchemaReadyCondition(backend *appsv1alpha1.Backend, status metav1.ConditionStatus, reason, message string) {
+	r.setCondition(backend, metav1.Condition{
+		Type:               "SchemaReady",
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: backend.Generation,
+		LastTransitionTime: metav1.Now(),
+	})
 }
 
 // reconcileQueue ensures a single Crossplane Queue CR exists with the given name.
@@ -513,6 +653,9 @@ func (r *BackendReconciler) handleDeletion(ctx context.Context, backend *appsv1a
 	if err := r.deleteQueue(ctx, backend); err != nil {
 		return err
 	}
+	if err := r.deleteSchema(ctx, backend); err != nil {
+		return err
+	}
 	if err := r.deleteRDS(ctx, backend); err != nil {
 		return err
 	}
@@ -676,6 +819,9 @@ func (r *BackendReconciler) updateStatus(ctx context.Context, statusBase, backen
 
 	if backend.Spec.Database == nil {
 		backend.Status.Conditions = removeCondition(backend.Status.Conditions, "RDSReady")
+		backend.Status.Conditions = removeCondition(backend.Status.Conditions, "SchemaReady")
+	} else if backend.Spec.Database.Schema == nil {
+		backend.Status.Conditions = removeCondition(backend.Status.Conditions, "SchemaReady")
 	}
 
 	return r.patchStatusIfChanged(ctx, statusBase, backend)
@@ -705,7 +851,7 @@ func (r *BackendReconciler) setCondition(backend *appsv1alpha1.Backend, cond met
 	if existing != nil {
 		if existing.Status != cond.Status {
 			existing.LastTransitionTime = metav1.Now()
-			if cond.Type == "Available" || cond.Type == "RDSReady" {
+			if cond.Type == "Available" || cond.Type == "RDSReady" || cond.Type == "SchemaReady" {
 				if cond.Status == metav1.ConditionFalse {
 					r.Recorder.Event(backend, corev1.EventTypeWarning, cond.Reason, cond.Message)
 				} else {
@@ -741,21 +887,35 @@ func (r *BackendReconciler) buildDeployment(backend *appsv1alpha1.Backend, queue
 		},
 	}
 
-	envVars := []corev1.EnvVar{
-		{Name: "PORT", Value: "8080"},
-		{Name: "DB_HOST", Value: "taskapp-database"},
-		{Name: "DB_PORT", Value: "5432"},
-		{Name: "DB_USER", Value: "taskuser"},
-		{Name: "DB_NAME", Value: "taskdb"},
-		{
-			Name: "DB_PASSWORD",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: backend.Spec.DBSecret},
-					Key:                  "POSTGRES_PASSWORD",
+	var envVars []corev1.EnvVar
+	if backend.Spec.Database != nil {
+		conn := connSecretName(backend)
+		envVars = []corev1.EnvVar{
+			{Name: "PORT", Value: "8080"},
+			secretKeyRefEnv("DB_HOST", conn, "endpoint"),
+			secretKeyRefEnv("DB_PORT", conn, "port"),
+			secretKeyRefEnv("DB_USER", conn, "username"),
+			secretKeyRefEnv("DB_PASSWORD", conn, "password"),
+			secretKeyRefEnv("DB_NAME", conn, "dbname"),
+			{Name: "DB_SSLMODE", Value: "require"},
+		}
+	} else {
+		envVars = []corev1.EnvVar{
+			{Name: "PORT", Value: "8080"},
+			{Name: "DB_HOST", Value: "taskapp-database"},
+			{Name: "DB_PORT", Value: "5432"},
+			{Name: "DB_USER", Value: "taskuser"},
+			{Name: "DB_NAME", Value: "taskdb"},
+			{
+				Name: "DB_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: backend.Spec.DBSecret},
+						Key:                  "POSTGRES_PASSWORD",
+					},
 				},
 			},
-		},
+		}
 	}
 	if queueURL != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: backend.Spec.Queue.URLEnvVar, Value: queueURL})
@@ -847,6 +1007,25 @@ func (r *BackendReconciler) buildService(backend *appsv1alpha1.Backend) *corev1.
 func deploymentName(b *appsv1alpha1.Backend) string  { return b.Name + "-backend" }
 func serviceName(b *appsv1alpha1.Backend) string     { return b.Name + "-backend" }
 func rdsInstanceName(b *appsv1alpha1.Backend) string { return b.Name }
+func schemaName(b *appsv1alpha1.Backend) string      { return b.Name + "-schema" }
+
+// connSecretName returns the name of the final connection secret produced by the
+// Crossplane composition: {xr-name}-database-connection-details.
+func connSecretName(b *appsv1alpha1.Backend) string {
+	return rdsXRName(b) + "-database-connection-details"
+}
+
+func secretKeyRefEnv(envName, secretName, key string) corev1.EnvVar {
+	return corev1.EnvVar{
+		Name: envName,
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Key:                  key,
+			},
+		},
+	}
+}
 
 // rdsXRName is the pinned cluster-scoped XR name for the Backend's RDS claim.
 // Namespace-qualified to avoid collisions when multiple namespaces use the same Backend name.
@@ -966,6 +1145,9 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	queueType := &unstructured.Unstructured{}
 	queueType.SetGroupVersionKind(sqsQueueGVK)
 
+	atlasSchemaType := &unstructured.Unstructured{}
+	atlasSchemaType.SetGroupVersionKind(atlasSchemaGVK)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Backend{}).
 		Owns(&appsv1.Deployment{}).
@@ -983,6 +1165,10 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}},
 				}
 			}),
+		).
+		Watches(
+			atlasSchemaType,
+			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.Backend{}),
 		).
 		Named("backend").
 		Complete(r)

@@ -9,12 +9,18 @@ spec:
   image: boicotaz/taskapp-backend
   tag: latest
   replicas: 1
-  # dbSecret is required until PR 2 wires buildDeployment() to the RDS connection secret.
-  # Without it the pod references a secret named "" and fails to start.
-  dbSecret: taskapp-database-secret
   database:
     dbName: taskapp
     size: small
+    schema:
+      sql: |
+        CREATE TABLE IF NOT EXISTS tasks (
+          id          SERIAL PRIMARY KEY,
+          title       VARCHAR(255),
+          description TEXT,
+          status      VARCHAR(50),
+          created_at  TIMESTAMP DEFAULT NOW()
+        );
 #  queue:
 #    type: standard
 #    deadLetter: false

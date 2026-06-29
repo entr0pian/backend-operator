@@ -73,6 +73,24 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - db.atlasgo.io
+  resources:
+  - atlasschemas
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - db.atlasgo.io
+  resources:
+  - atlasschemas/status
+  verbs:
+  - get
+- apiGroups:
   - external-secrets.io
   resources:
   - externalsecrets

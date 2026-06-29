@@ -31,6 +31,10 @@ spec:
       name: RDSReady
       priority: 1
       type: string
+    - jsonPath: .status.conditions[?(@.type=="SchemaReady")].status
+      name: SchemaReady
+      priority: 1
+      type: string
     - jsonPath: .status.queueURL
       name: QueueURL
       priority: 1

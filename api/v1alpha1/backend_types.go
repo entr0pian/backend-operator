@@ -142,6 +142,7 @@ type BackendStatus struct {
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
 // +kubebuilder:printcolumn:name="RDSReady",type=string,JSONPath=`.status.conditions[?(@.type=="RDSReady")].status`,priority=1
+// +kubebuilder:printcolumn:name="SchemaReady",type=string,JSONPath=`.status.conditions[?(@.type=="SchemaReady")].status`,priority=1
 // +kubebuilder:printcolumn:name="QueueURL",type=string,JSONPath=`.status.queueURL`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
