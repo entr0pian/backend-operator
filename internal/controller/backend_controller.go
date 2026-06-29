@@ -233,6 +233,9 @@ func (r *BackendReconciler) reconcileRDS(ctx context.Context, backend *appsv1alp
 		"apps.taskapp.io/owned-by-backend":   backend.Name,
 		"apps.taskapp.io/owned-by-namespace": backend.Namespace,
 	})
+	if err := ctrl.SetControllerReference(backend, desired, r.Scheme); err != nil {
+		return false, err
+	}
 
 	// Pin the XR name to {namespace}-{name} so all Crossplane-derived resource
 	// names (AWS RDS identifier, connection secret) are deterministic. Without
@@ -274,12 +277,17 @@ func (r *BackendReconciler) reconcileRDS(ctx context.Context, backend *appsv1alp
 	}
 
 	existingParameters, _, _ := unstructured.NestedMap(existing.Object, "spec", "parameters")
-	if rdsParametersDrifted(existingParameters, parameters) {
+	ownerRefMissing := !controllerutil.HasControllerReference(existing)
+
+	if rdsParametersDrifted(existingParameters, parameters) || ownerRefMissing {
 		patch := client.MergeFrom(existing.DeepCopy())
 		if err := unstructured.SetNestedField(existing.Object, parameters, "spec", "parameters"); err != nil {
 			return false, err
 		}
 		existing.SetLabels(desired.GetLabels())
+		if err := ctrl.SetControllerReference(backend, existing, r.Scheme); err != nil {
+			return false, err
+		}
 		if err := r.Patch(ctx, existing, patch); err != nil {
 			return false, err
 		}
@@ -1148,6 +1156,9 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	atlasSchemaType := &unstructured.Unstructured{}
 	atlasSchemaType.SetGroupVersionKind(atlasSchemaGVK)
 
+	rdsInstanceType := &unstructured.Unstructured{}
+	rdsInstanceType.SetGroupVersionKind(rdsInstanceGVK)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Backend{}).
 		Owns(&appsv1.Deployment{}).
@@ -1168,6 +1179,10 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Watches(
 			atlasSchemaType,
+			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.Backend{}),
+		).
+		Watches(
+			rdsInstanceType,
 			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.Backend{}),
 		).
 		Named("backend").
