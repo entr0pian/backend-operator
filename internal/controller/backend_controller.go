@@ -528,6 +528,10 @@ func (r *BackendReconciler) deleteQueue(ctx context.Context, backend *appsv1alph
 		claim.SetName(name)
 		claim.SetNamespace(backend.Namespace)
 		err := r.Delete(ctx, claim)
+		if apimeta.IsNoMatchError(err) {
+			log.Info("SQSQueue CRD not yet installed, skipping delete")
+			return nil
+		}
 		if client.IgnoreNotFound(err) != nil {
 			return err
 		}
@@ -1133,12 +1137,19 @@ func (r *BackendReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	atlasSchemaType := &unstructured.Unstructured{}
 	atlasSchemaType.SetGroupVersionKind(atlasSchemaGVK)
 
+	rdsInstanceType := &unstructured.Unstructured{}
+	rdsInstanceType.SetGroupVersionKind(rdsInstanceGVK)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Backend{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Watches(
 			atlasSchemaType,
+			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.Backend{}),
+		).
+		Watches(
+			rdsInstanceType,
 			handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.Backend{}),
 		).
 		Named("backend").

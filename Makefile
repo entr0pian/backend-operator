@@ -18,6 +18,8 @@ CONTAINER_TOOL ?= docker
 
 # Path to the CRD file in the Helm chart (relative to this Makefile)
 HELM_CRD ?= ../../helm-charts/backend-operator/templates/backend-crd.yaml
+# Path to the RBAC file in the Helm chart (relative to this Makefile)
+HELM_RBAC ?= ../../helm-charts/backend-operator/templates/manager-rbac.yaml
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
@@ -53,6 +55,13 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 .PHONY: sync-helm-crd
 sync-helm-crd: manifests ## Sync the generated CRD into the Helm chart.
 	cp config/crd/bases/apps.taskapp.io_backends.yaml "$(HELM_CRD)"
+
+.PHONY: sync-helm-rbac
+sync-helm-rbac: manifests ## Sync generated RBAC rules from config/rbac/role.yaml into the Helm chart ClusterRole.
+	python3 hack/sync-helm-rbac.py config/rbac/role.yaml "$(HELM_RBAC)"
+
+.PHONY: sync-helm
+sync-helm: sync-helm-crd sync-helm-rbac ## Sync both CRD and RBAC into the Helm chart.
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
