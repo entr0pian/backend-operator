@@ -103,9 +103,9 @@ rules:
   - update
   - watch
 - apiGroups:
-  - sqs.aws.upbound.io
+  - queue.taskapp.io
   resources:
-  - queues
+  - sqsqueues
   verbs:
   - create
   - delete
@@ -115,8 +115,8 @@ rules:
   - update
   - watch
 - apiGroups:
-  - sqs.aws.upbound.io
+  - queue.taskapp.io
   resources:
-  - queues/status
+  - sqsqueues/status
   verbs:
   - get

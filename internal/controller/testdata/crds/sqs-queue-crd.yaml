@@ -1,17 +1,17 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: queues.sqs.aws.upbound.io
+  name: sqsqueues.queue.taskapp.io
 spec:
-  group: sqs.aws.upbound.io
+  group: queue.taskapp.io
   names:
-    kind: Queue
-    listKind: QueueList
-    plural: queues
-    singular: queue
-  scope: Cluster
+    kind: SQSQueue
+    listKind: SQSQueueList
+    plural: sqsqueues
+    singular: sqsqueue
+  scope: Namespaced
   versions:
-  - name: v1beta1
+  - name: v1alpha1
     served: true
     storage: true
     schema:
@@ -20,9 +20,30 @@ spec:
         properties:
           spec:
             type: object
-            x-kubernetes-preserve-unknown-fields: true
+            properties:
+              parameters:
+                type: object
+                properties:
+                  region:
+                    type: string
+                  fifo:
+                    type: boolean
+                  deadLetterArn:
+                    type: string
+              resourceRef:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
           status:
             type: object
-            x-kubernetes-preserve-unknown-fields: true
+            properties:
+              queueUrl:
+                type: string
+              queueArn:
+                type: string
+              conditions:
+                type: array
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
     subresources:
       status: {}
